@@ -21,6 +21,7 @@
 
 #include <vulkan/vulkan.hpp>
 
+#include "nvh/alignment.hpp"
 #include "nvp/nvpsystem.hpp"
 #include "nvh/fileoperations.hpp"
 #include "nvh/inputparser.h"
@@ -41,20 +42,23 @@ VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
 typedef VkFlags64 VkMemoryDecompressionMethodFlagsNV;
 
-typedef void (VKAPI_PTR* PFN_vkCmdDecompressMemoryIndirectCountNV)(VkCommandBuffer commandBuffer,
-  VkDeviceAddress indirectCommandsAddress, VkDeviceAddress indirectCommandsCountAddress,
-  uint32_t stride);
+typedef void(VKAPI_PTR* PFN_vkCmdDecompressMemoryIndirectCountNV)(VkCommandBuffer commandBuffer,
+                                                                  VkDeviceAddress indirectCommandsAddress,
+                                                                  VkDeviceAddress indirectCommandsCountAddress,
+                                                                  uint32_t        stride);
 
-typedef enum VkMemoryDecompressionMethodFlagBitsNV {
+typedef enum VkMemoryDecompressionMethodFlagBitsNV
+{
   VK_MEMORY_DECOMPRESSION_METHOD_GDEFLATE_1_0_BIT_NV = 1,
 } VkMemoryDecompressionMethodFlagBitsNV;
 
-typedef struct VkDecompressMemoryRegionNV {
-  VkDeviceAddress                       srcAddress;
-  VkDeviceAddress                       dstAddress;
-  VkDeviceSize                          compressedSize;
-  VkDeviceSize                          decompressedSize;
-  VkMemoryDecompressionMethodFlagsNV    decompressionMethod;
+typedef struct VkDecompressMemoryRegionNV
+{
+  VkDeviceAddress                    srcAddress;
+  VkDeviceAddress                    dstAddress;
+  VkDeviceSize                       compressedSize;
+  VkDeviceSize                       decompressedSize;
+  VkMemoryDecompressionMethodFlagsNV decompressionMethod;
 } VkDecompressMemoryRegionNV;
 
 static PFN_vkCmdDecompressMemoryIndirectCountNV vkCmdDecompressMemoryIndirectCountNV = nullptr;
@@ -72,7 +76,7 @@ static constexpr size_t kIntermediateBufferSize = kMaxPagesPerBatch * kGDeflateP
 // A trivial paged compressed stream
 //
 // Format:
-// 
+//
 // [magic number:32]
 // [(page 0 compressed size - 1):32]
 // [page 0 compressed bits]
@@ -88,11 +92,12 @@ static constexpr size_t kIntermediateBufferSize = kMaxPagesPerBatch * kGDeflateP
 // page is stored in the PageHeader. A special tag kEndOfPagesTag signals the end-of-pages
 // condition, and is immedeately followed by stream footer data.
 //
-template<bool IsInput>
-class CompressedPageStream: public std::conditional_t<IsInput, std::ifstream, std::ofstream>
+template <bool IsInput>
+class CompressedPageStream : public std::conditional_t<IsInput, std::ifstream, std::ofstream>
 {
   typedef std::conditional_t<IsInput, std::ifstream, std::ofstream> BaseClass;
-  static constexpr char* kMagic = "GDEF";
+  // Note: This declaration should be read as "kMagic is a static constexpr pointer to const char":
+  static constexpr const char* kMagic = "GDEF";
 
 public:
   // Page header structure preceding each compressed page data
@@ -110,60 +115,59 @@ public:
 
   // Special end-of-pages tag
   static constexpr uint32_t kEndOfPagesTag = 1;
-  inline static PageHeader endOfPagesTag{ kEndOfPagesTag };
+  inline static PageHeader  endOfPagesTag{kEndOfPagesTag};
 
   explicit CompressedPageStream(const std::string& filename)
-  : BaseClass(filename.c_str(), BaseClass::binary | (IsInput ? BaseClass::in : BaseClass::out))
+      : BaseClass(filename.c_str(), BaseClass::binary | (IsInput ? BaseClass::in : BaseClass::out))
   {
-    if (BaseClass::is_open() && BaseClass::good())
+    if(BaseClass::is_open() && BaseClass::good())
     {
-      if constexpr (IsInput)
+      if constexpr(IsInput)
       {
-        char magic[5] = { 0 };
-        read(magic, 4);
+        char magic[5] = {0};
+        this->read(magic, 4);
 
-        if (0 != strcmp(magic, kMagic))
+        if(0 != strcmp(magic, kMagic))
         {
           LOGE("File %s is not a GDEFLATE sample page stream.\n", filename.c_str());
-          setstate(std::ios_base::badbit);
+          this->setstate(std::ios_base::badbit);
         }
       }
       else
       {
-        write(kMagic, 4);
+        this->write(kMagic, 4);
       }
     }
   }
 
-  CompressedPageStream& operator<< (const libdeflate_gdeflate_out_page& page)
+  CompressedPageStream& operator<<(const libdeflate_gdeflate_out_page& page)
   {
-    if constexpr (!IsInput)
+    if constexpr(!IsInput)
     {
-      const PageHeader pageHeader{ static_cast<uint32_t>(page.nbytes) };
-      write(reinterpret_cast<const char*>(&pageHeader), sizeof(pageHeader));
-      write(static_cast<char*>(page.data), page.nbytes);
+      const PageHeader pageHeader{static_cast<uint32_t>(page.nbytes)};
+      this->write(reinterpret_cast<const char*>(&pageHeader), sizeof(pageHeader));
+      this->write(static_cast<char*>(page.data), page.nbytes);
     }
 
     return *this;
   }
 
-  CompressedPageStream& operator<< (libdeflate_gdeflate_in_page& page)
+  CompressedPageStream& operator<<(libdeflate_gdeflate_in_page& page)
   {
-    if constexpr (IsInput)
+    if constexpr(IsInput)
     {
-      if (page.data == nullptr || page.nbytes == 0)
+      if(page.data == nullptr || page.nbytes == 0)
         return *this;
 
       PageHeader pageHeader;
-      if (!readChecked(&pageHeader, sizeof(pageHeader)))
+      if(!readChecked(&pageHeader, sizeof(pageHeader)))
         return *this;
 
-      if (pageHeader.compressedSize != kEndOfPagesTag)
+      if(pageHeader.compressedSize != kEndOfPagesTag)
       {
-        if (pageHeader.compressedSize > page.nbytes)
+        if(pageHeader.compressedSize > page.nbytes)
         {
-          LOGE("Page read buffer too small for a page size %d.\n",
-              pageHeader.compressedSize);
+          LOGE("Page read buffer too small for a page size %d.\n", pageHeader.compressedSize);
           throw("Page read buffer too small");
         }
 
@@ -180,48 +184,48 @@ public:
     return *this;
   }
 
-  CompressedPageStream& operator<< (PageHeader& pageHeader)
+  CompressedPageStream& operator<<(PageHeader& pageHeader)
   {
-    if constexpr (IsInput)
+    if constexpr(IsInput)
     {
       readChecked(&pageHeader, sizeof(pageHeader));
     }
     else
     {
-      write(reinterpret_cast<char*>(&pageHeader), sizeof(pageHeader));
+      this->write(reinterpret_cast<char*>(&pageHeader), sizeof(pageHeader));
     }
 
     return *this;
   }
 
-  CompressedPageStream& operator<< (Footer& footer)
+  CompressedPageStream& operator<<(Footer& footer)
   {
-    if constexpr (IsInput)
+    if constexpr(IsInput)
     {
       readChecked(&footer, sizeof(footer));
     }
     else
     {
-      write(reinterpret_cast<char*>(&footer), sizeof(footer));
+      this->write(reinterpret_cast<char*>(&footer), sizeof(footer));
     }
 
     return *this;
   }
 
 private:
-  template<typename T>
+  template <typename T>
   bool readChecked(T* out, size_t size)
   {
-    if constexpr (IsInput)
+    if constexpr(IsInput)
     {
-      const size_t pos = tellg();
+      const size_t pos = this->tellg();
 
-      read(reinterpret_cast<char*>(out), size);
+      this->read(reinterpret_cast<char*>(out), size);
 
-      if (gcount() != size)
+      if(this->gcount() != size)
       {
         LOGE("Corrupted GDEFLATE sample page stream at %zd.\n", pos);
-        setstate(std::ios_base::failbit);
+        this->setstate(std::ios_base::failbit);
         return false;
       }
 
@@ -234,11 +238,11 @@ private:
 
 //--------------------------------------------------------------------------------------------------
 typedef CompressedPageStream<false> OutputCompressedPageStream;
-typedef CompressedPageStream<true> InputCompressedPageStream;
+typedef CompressedPageStream<true>  InputCompressedPageStream;
 
 //--------------------------------------------------------------------------------------------------
 // Compress on CPU the 'inFile' to 'outFile' at compression level 'level'.
-// 
+//
 // This is a batched compressor that will be compressing up to kIntermediateBufferSize bytes
 // of data per batch.
 //
@@ -246,7 +250,7 @@ static bool Compress(const std::string& outFile, const std::string& inFile, uint
 {
   std::ifstream fin(inFile, std::ifstream::binary | std::ifstream::in);
 
-  if (!fin.is_open() || !fin.good())
+  if(!fin.is_open() || !fin.good())
   {
     LOGE("Unable to open: %s\n", inFile.c_str());
     return false;
@@ -254,46 +258,44 @@ static bool Compress(const std::string& outFile, const std::string& inFile, uint
 
   OutputCompressedPageStream fout(outFile);
 
-  if (!fout.is_open() || !fout.good())
+  if(!fout.is_open() || !fout.good())
   {
     LOGE("Unable to create file: %s\n", outFile.c_str());
     return false;
   }
 
-  level = level == 0 ? 1 : level;
-  level = level > 12 ? 12 : level;
+  level  = level == 0 ? 1 : level;
+  level  = level > 12 ? 12 : level;
   auto c = libdeflate_alloc_gdeflate_compressor(level);
 
-  if (c == nullptr)
+  if(c == nullptr)
   {
     LOGE("Unable to allocate GDEFLATE compressor.\n");
     return false;
   }
 
-  size_t uncompressedSize = 0;
-  uint32_t crc32 = 0;
+  size_t   uncompressedSize = 0;
+  uint32_t crc32            = 0;
 
-  std::vector<char> uncompressed(kIntermediateBufferSize);
-  std::vector<char> compressed(kIntermediateBufferSize);
-  std::vector<libdeflate_gdeflate_out_page> pages(
-    kIntermediateBufferSize / kGDeflatePageSize + 1);
+  std::vector<char>                         uncompressed(kIntermediateBufferSize);
+  std::vector<char>                         compressed(kIntermediateBufferSize);
+  std::vector<libdeflate_gdeflate_out_page> pages(kIntermediateBufferSize / kGDeflatePageSize + 1);
 
   LOGI("Compressing %s", inFile.c_str());
 
-  while (true)
+  while(true)
   {
     fin.read(uncompressed.data(), uncompressed.size());
 
     const size_t bytesRead = fin.gcount();
 
-    if (bytesRead == 0)
+    if(bytesRead == 0)
       break;
 
     // Calculate the number of GDEFLATE pages and the amount of intermediate
     // memory required
     size_t npages;
-    size_t compBound = libdeflate_gdeflate_compress_bound(nullptr,
-      bytesRead, &npages);
+    size_t compBound     = libdeflate_gdeflate_compress_bound(nullptr, bytesRead, &npages);
     size_t pageCompBound = compBound / npages;
 
     // Make sure compressed data fits.
@@ -303,19 +305,18 @@ static bool Compress(const std::string& outFile, const std::string& inFile, uint
 
     // Initialize output page table
     uint32_t pageIdx = 0;
-    for (auto& page : pages)
+    for(auto& page : pages)
     {
-      page.data = compressed.data() + pageIdx * pageCompBound;
+      page.data   = compressed.data() + pageIdx * pageCompBound;
       page.nbytes = pageCompBound;
       ++pageIdx;
     }
 
     // Compress pages
-    if (libdeflate_gdeflate_compress(c, uncompressed.data(),
-      bytesRead, pages.data(), npages))
+    if(libdeflate_gdeflate_compress(c, uncompressed.data(), bytesRead, pages.data(), npages))
     {
       // Gather and write compressed pages to output stream
-      for (auto& page : pages)
+      for(auto& page : pages)
       {
         fout << page;
       }
@@ -340,7 +341,7 @@ static bool Compress(const std::string& outFile, const std::string& inFile, uint
   // Write stream footer
   OutputCompressedPageStream::Footer footer;
   footer.tailPageUncompressedSize = uncompressedSize % kGDeflatePageSize;
-  footer.crc32 = crc32;
+  footer.crc32                    = crc32;
 
   fout << footer;
 
@@ -348,31 +349,30 @@ static bool Compress(const std::string& outFile, const std::string& inFile, uint
 
   const size_t compressedSize = fout.tellp();
 
-  LOGI(" done!\n%d bytes -> %zd bytes (ratio: %0.2f:1)\n",
-    uncompressedSize, compressedSize,
-    static_cast<float>(uncompressedSize) / compressedSize);
+  LOGI(" done!\n%zu bytes -> %zu bytes (ratio: %0.2f:1)\n", uncompressedSize, compressedSize,
+       static_cast<float>(uncompressedSize) / compressedSize);
 
   return true;
 }
 
 //--------------------------------------------------------------------------------------------------
 // Decompress on CPU 'inFile' to 'outFile'.
-// 
+//
 // A trivial non-batched CPU decompressor that decodes each GDeflate page separately.
 //
 static bool DecompressCPU(const std::string& outFile, const std::string& inFile)
 {
   InputCompressedPageStream fin(inFile);
 
-  if (!fin.is_open() || !fin.good())
+  if(!fin.is_open() || !fin.good())
   {
-    LOGE("Unable to open file: %s\n", inFile);
+    LOGE("Unable to open file: %s\n", inFile.c_str());
     return false;
   }
 
   std::ofstream fout(outFile, std::ofstream::binary | std::ofstream::out);
 
-  if (!fout.is_open() || !fout.good())
+  if(!fout.is_open() || !fout.good())
   {
     LOGE("Unable to create file: %s\n", outFile.c_str());
     return false;
@@ -380,7 +380,7 @@ static bool DecompressCPU(const std::string& outFile, const std::string& inFile)
 
   auto d = libdeflate_alloc_gdeflate_decompressor();
 
-  if (d == nullptr)
+  if(d == nullptr)
   {
     LOGE("Unable to allocate GDEFLATE decompressor.\n");
     return false;
@@ -390,16 +390,16 @@ static bool DecompressCPU(const std::string& outFile, const std::string& inFile)
 
   std::vector<char> in(kGDeflatePageSize);
   std::vector<char> out(kGDeflatePageSize);
-  uint32_t crc32 = 0;
+  uint32_t          crc32 = 0;
 
-  while (true)
+  while(true)
   {
     // Read a compressed page header
     InputCompressedPageStream::PageHeader pageHeader;
     fin << pageHeader;
 
     // Early out in case of the end of pages
-    if (pageHeader.compressedSize == InputCompressedPageStream::kEndOfPagesTag)
+    if(pageHeader.compressedSize == InputCompressedPageStream::kEndOfPagesTag)
       break;
 
     // Make sure page data fits
@@ -409,12 +409,12 @@ static bool DecompressCPU(const std::string& outFile, const std::string& inFile)
     fin.read(in.data(), in.size());
 
     // Early out in case of an error
-    if (!fin.good())
+    if(!fin.good())
       break;
 
     // Decompress page
-    libdeflate_gdeflate_in_page page{ in.data(), in.size() };
-    size_t outSize = 0;
+    libdeflate_gdeflate_in_page page{in.data(), in.size()};
+    size_t                      outSize = 0;
     libdeflate_gdeflate_decompress(d, &page, 1, out.data(), out.size(), &outSize);
 
     // Update rolling crc32
@@ -426,7 +426,7 @@ static bool DecompressCPU(const std::string& outFile, const std::string& inFile)
 
   libdeflate_free_gdeflate_decompressor(d);
 
-  if (!fin.good())
+  if(!fin.good())
     return false;
 
   // Read footer info
@@ -434,7 +434,7 @@ static bool DecompressCPU(const std::string& outFile, const std::string& inFile)
   fin << footer;
 
   // Verify crc32
-  if (footer.crc32 != crc32)
+  if(footer.crc32 != crc32)
   {
     LOGE(" CRC32 failed (got %x, expected %x)!\n", crc32, footer.crc32);
     return false;
@@ -447,7 +447,7 @@ static bool DecompressCPU(const std::string& outFile, const std::string& inFile)
 
 //--------------------------------------------------------------------------------------------------
 // Decompress on GPU 'inFile' to 'outFile'.
-// 
+//
 // A batched GPU decompressor implementation that decodes up to kIntermediateBufferSize bytes
 // of data and kMaxPagesPerBatch of pages in each batch.
 //
@@ -459,17 +459,17 @@ static bool DecompressGPU(const std::string& outFile, const std::string& inFile,
 {
   InputCompressedPageStream fin(inFile);
 
-  if (!fin.is_open() || !fin.good())
+  if(!fin.is_open() || !fin.good())
   {
-    LOGE("Unable to open file: %s\n", inFile);
+    LOGE("Unable to open file: %s\n", inFile.c_str());
     return false;
   }
 
   std::ofstream fout(outFile, std::ofstream::binary | std::ofstream::out);
 
-  if (!fout.is_open() || !fout.good())
+  if(!fout.is_open() || !fout.good())
   {
-    LOGE("Unable to create file: %s\n", outFile);
+    LOGE("Unable to create file: %s\n", outFile.c_str());
     return false;
   }
 
@@ -480,30 +480,34 @@ static bool DecompressGPU(const std::string& outFile, const std::string& inFile,
   alloc.init(ctx.m_device, ctx.m_physicalDevice);
 
   // Buffer for transfer
-  nvvk::Buffer transferBuffer = alloc.createBuffer(kIntermediateBufferSize,
-    vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eTransferSrc |
-    vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eHostVisible |
-    vk::MemoryPropertyFlagBits::eHostCached);
+  nvvk::Buffer transferBuffer =
+      alloc.createBuffer(kIntermediateBufferSize,
+                         vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eTransferSrc
+                             | vk::BufferUsageFlagBits::eTransferDst,
+                         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCached);
 
   // Buffer for compressed data
   nvvk::Buffer srcBuffer = alloc.createBuffer(kIntermediateBufferSize,
-    vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eTransferDst |
-    vk::BufferUsageFlagBits::eShaderDeviceAddress, vk::MemoryPropertyFlagBits::eDeviceLocal);
+                                              vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eTransferDst
+                                                  | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+                                              vk::MemoryPropertyFlagBits::eDeviceLocal);
 
   VkDeviceAddress srcAddr = nvvk::getBufferDeviceAddress(ctx.m_device, srcBuffer.buffer);
 
   // Buffer for uncompressed data
   nvvk::Buffer dstBuffer = alloc.createBuffer(kIntermediateBufferSize,
-    vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eTransferSrc |
-    vk::BufferUsageFlagBits::eShaderDeviceAddress, vk::MemoryPropertyFlagBits::eDeviceLocal);
+                                              vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eTransferSrc
+                                                  | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+                                              vk::MemoryPropertyFlagBits::eDeviceLocal);
 
   VkDeviceAddress dstAddr = nvvk::getBufferDeviceAddress(ctx.m_device, dstBuffer.buffer);
 
   // Indirect param buffer
-  nvvk::Buffer paramBuffer = alloc.createBuffer(sizeof(VkDeviceSize) +
-    sizeof(VkDecompressMemoryRegionNV) * kMaxPagesPerBatch,
-    vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eIndirectBuffer,
-    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCached);
+  nvvk::Buffer paramBuffer =
+      alloc.createBuffer(sizeof(VkDeviceSize) + sizeof(VkDecompressMemoryRegionNV) * kMaxPagesPerBatch,
+                         vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eIndirectBuffer
+                             | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+                         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCached);
 
   VkDeviceAddress paramAddr = nvvk::getBufferDeviceAddress(ctx.m_device, paramBuffer.buffer);
 
@@ -528,31 +532,31 @@ static bool DecompressGPU(const std::string& outFile, const std::string& inFile,
   // The loop will run until no more pages left in stream
   bool havePages = true;
 
-  while (havePages)
+  while(havePages)
   {
     // Read compressed pages to transfer buffer and create
     // decompression parameters table for a decompression batch
-    *pageCountPtr = 0;
-    size_t compressedBytesThisBatch = 0;
+    *pageCountPtr                     = 0;
+    size_t compressedBytesThisBatch   = 0;
     size_t uncompressedBytesThisBatch = 0;
 
     // Read up to kMaxPagesPerBatch pages per decompression batch
-    for (uint32_t page = 0; page < kMaxPagesPerBatch; page++)
+    for(uint32_t page = 0; page < kMaxPagesPerBatch; page++)
     {
       // Read next compressed page size if we do not have a carry-over page
       // pending from previous batch
-      if (page > 0 || lastPageCompressedSize == 0)
+      if(page > 0 || lastPageCompressedSize == 0)
       {
         InputCompressedPageStream::PageHeader pageHeader;
         fin << pageHeader;
 
-        if (pageHeader.compressedSize == InputCompressedPageStream::kEndOfPagesTag)
+        if(pageHeader.compressedSize == InputCompressedPageStream::kEndOfPagesTag)
         {
           // Page stream ended - read footer
           InputCompressedPageStream::Footer footer;
           fin << footer;
 
-          if (*pageCountPtr > 0)
+          if(*pageCountPtr > 0)
           {
             // If we have a batch pending - adjust the last batched page parameters
             // using the tail page uncompressed size before dispatch
@@ -572,19 +576,19 @@ static bool DecompressGPU(const std::string& outFile, const std::string& inFile,
       }
 
       // Check if compressed page fits into source buffer
-      if (compressedBytesThisBatch + lastPageCompressedSize > kIntermediateBufferSize)
+      if(compressedBytesThisBatch + lastPageCompressedSize > kIntermediateBufferSize)
         break;
 
       // Check if uncompressed page fits into destination buffer
-      if (uncompressedBytesThisBatch + kGDeflatePageSize > kIntermediateBufferSize)
+      if(uncompressedBytesThisBatch + kGDeflatePageSize > kIntermediateBufferSize)
         break;
 
       // Preapare page decompression parameters
-      auto region = regionsPtr + *pageCountPtr;
-      region->srcAddress = srcAddr + compressedBytesThisBatch;
-      region->dstAddress = dstAddr + page * kGDeflatePageSize;
-      region->compressedSize = lastPageCompressedSize;
-      region->decompressedSize = kGDeflatePageSize;
+      auto region                 = regionsPtr + *pageCountPtr;
+      region->srcAddress          = srcAddr + compressedBytesThisBatch;
+      region->dstAddress          = dstAddr + page * kGDeflatePageSize;
+      region->compressedSize      = lastPageCompressedSize;
+      region->decompressedSize    = kGDeflatePageSize;
       region->decompressionMethod = VK_MEMORY_DECOMPRESSION_METHOD_GDEFLATE_1_0_BIT_NV;
 
       // Read compressed page bits to transfer buffer
@@ -598,7 +602,7 @@ static bool DecompressGPU(const std::string& outFile, const std::string& inFile,
     }
 
     // No more pages to decode - bail out
-    if (*pageCountPtr == 0)
+    if(*pageCountPtr == 0)
       break;
 
     // Flush the mapped buffers
@@ -606,14 +610,16 @@ static bool DecompressGPU(const std::string& outFile, const std::string& inFile,
       auto tbmi = alloc.getMemoryAllocator()->getMemoryInfo(transferBuffer.memHandle);
       auto pbmi = alloc.getMemoryAllocator()->getMemoryInfo(paramBuffer.memHandle);
 
-      vk::MappedMemoryRange flushRanges[2] = {
-        vk::MappedMemoryRange(tbmi.memory, 0, compressedBytesThisBatch),
-        vk::MappedMemoryRange(pbmi.memory, 0, sizeof(*pageCountPtr) +
-          *pageCountPtr * sizeof(VkDecompressMemoryRegionNV))
-      };
+      // vkFlushMappedMemoryRanges requires sizes to be a multiple of nonCoherentAtomSize:
+      const VkDeviceSize atomSize = ctx.m_physicalInfo.properties10.limits.nonCoherentAtomSize;
 
-      vkFlushMappedMemoryRanges(ctx.m_device, _countof(flushRanges),
-        reinterpret_cast<const VkMappedMemoryRange*>(flushRanges));
+      vk::MappedMemoryRange flushRanges[2] = {
+          vk::MappedMemoryRange(tbmi.memory, 0, nvh::align_up(compressedBytesThisBatch, atomSize)),
+          vk::MappedMemoryRange(pbmi.memory, 0,
+                                nvh::align_up(sizeof(*pageCountPtr) + *pageCountPtr * sizeof(VkDecompressMemoryRegionNV), atomSize))};
+
+      vkFlushMappedMemoryRanges(ctx.m_device, std::extent_v<decltype(flushRanges)>,
+                                reinterpret_cast<const VkMappedMemoryRange*>(flushRanges));
     }
 
     vk::CommandBuffer cmdBuf = genCmdBuf.createCommandBuffer();
@@ -624,42 +630,37 @@ static bool DecompressGPU(const std::string& outFile, const std::string& inFile,
     cmdBuf.copyBuffer(transferBuffer.buffer, srcBuffer.buffer, 1, &region);
 
     auto barrier = vk::BufferMemoryBarrier()
-      .setSrcAccessMask(vk::AccessFlagBits::eTransferWrite)
-      .setDstAccessMask(vk::AccessFlagBits::eShaderRead)
-      .setSrcQueueFamilyIndex(ctx.m_queueGCT.queueIndex)
-      .setDstQueueFamilyIndex(ctx.m_queueGCT.queueIndex)
-      .setBuffer(srcBuffer.buffer)
-      .setOffset(0)
-      .setSize(VK_WHOLE_SIZE);
+                       .setSrcAccessMask(vk::AccessFlagBits::eTransferWrite)
+                       .setDstAccessMask(vk::AccessFlagBits::eShaderRead)
+                       .setSrcQueueFamilyIndex(ctx.m_queueGCT.queueIndex)
+                       .setDstQueueFamilyIndex(ctx.m_queueGCT.queueIndex)
+                       .setBuffer(srcBuffer.buffer)
+                       .setOffset(0)
+                       .setSize(VK_WHOLE_SIZE);
 
-    cmdBuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-      vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlagBits::eByRegion,
-      0, nullptr, 1, &barrier, 0, nullptr);
+    cmdBuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eComputeShader,
+                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &barrier, 0, nullptr);
 
     // Dispatch decompression command for this batch
 #ifdef VK_NV_memory_decompression
-    cmdBuf.decompressMemoryIndirectCountNV(paramAddr + sizeof(*pageCountPtr),
-      paramAddr, sizeof(VkDecompressMemoryRegionNV));
+    cmdBuf.decompressMemoryIndirectCountNV(paramAddr + sizeof(*pageCountPtr), paramAddr, sizeof(VkDecompressMemoryRegionNV));
 #else
-    vkCmdDecompressMemoryIndirectCountNV(cmdBuf, paramAddr + sizeof(*pageCountPtr),
-      paramAddr, sizeof(VkDecompressMemoryRegionNV));
+    vkCmdDecompressMemoryIndirectCountNV(cmdBuf, paramAddr + sizeof(*pageCountPtr), paramAddr, sizeof(VkDecompressMemoryRegionNV));
 #endif
 
     barrier.setSrcAccessMask(vk::AccessFlagBits::eShaderWrite)
-      .setDstAccessMask(vk::AccessFlagBits::eTransferRead)
-      .setBuffer(dstBuffer.buffer);
+        .setDstAccessMask(vk::AccessFlagBits::eTransferRead)
+        .setBuffer(dstBuffer.buffer);
 
-    cmdBuf.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-      vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
-      0, nullptr, 1, &barrier, 0, nullptr);
+    cmdBuf.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eTransfer,
+                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &barrier, 0, nullptr);
 
     barrier.setSrcAccessMask(vk::AccessFlagBits::eShaderRead)
-      .setDstAccessMask(vk::AccessFlagBits::eTransferWrite)
-      .setBuffer(srcBuffer.buffer);
+        .setDstAccessMask(vk::AccessFlagBits::eTransferWrite)
+        .setBuffer(srcBuffer.buffer);
 
-    cmdBuf.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-      vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
-      0, nullptr, 1, &barrier, 0, nullptr);
+    cmdBuf.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eTransfer,
+                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &barrier, 0, nullptr);
 
     // Download decoded data from the destination GPU-local buffer to transfer buffer
     region.setSize(uncompressedBytesThisBatch);
@@ -667,8 +668,7 @@ static bool DecompressGPU(const std::string& outFile, const std::string& inFile,
 
     // Submit and wait for result.
     // NOTE: ideally decompression stage should be pipelined with the IO and upload stages.
-    genCmdBuf.submitAndWait(cmdBuf);
-    genCmdBuf.destroy(cmdBuf);
+    genCmdBuf.submitAndWait(cmdBuf);  // Destroys cmdBuf
 
     // Update rolling crc32
     crc32 = libdeflate_crc32(crc32, transferPtr, uncompressedBytesThisBatch);
@@ -678,7 +678,7 @@ static bool DecompressGPU(const std::string& outFile, const std::string& inFile,
   }
 
   // Verify crc32
-  if (expectedCrc32 != crc32)
+  if(expectedCrc32 != crc32)
   {
     LOGE("CRC32 failed (got %x, expected %x)!\n", crc32, expectedCrc32);
     return false;
@@ -706,10 +706,10 @@ int main(int argc, char** argv)
 
   InputParser parser(argc, argv);
 
-  const std::string in = parser.getString("-i");
+  const std::string in  = parser.getString("-i");
   const std::string out = parser.getString("-o");
 
-  if (parser.exist("-h") || in.empty() || out.empty())
+  if(parser.exist("-h") || in.empty() || out.empty())
   {
     LOGE("\n vk_memory_decompression.exe OPTIONS\n");
     LOGE("     -c <level> : compress input file to output file at level 1..12\n");
@@ -719,14 +719,14 @@ int main(int argc, char** argv)
     return 1;
   }
 
-  if (parser.exist("-c"))
+  if(parser.exist("-c"))
   {
     // Do compression if requested
     const uint32_t level = parser.getInt("-c", 8);
     return Compress(out, in, level) ? 0 : -1;
   }
 
-  if (parser.exist("-d"))
+  if(parser.exist("-d"))
   {
     // Do CPU decompression if requested
     return DecompressCPU(out, in) ? 0 : -1;
@@ -735,7 +735,7 @@ int main(int argc, char** argv)
   // Do GPU decompression by default
 
   // Creating the Vulkan instance and device
-  nvvk::Context vkctx;
+  nvvk::Context           vkctx;
   nvvk::ContextCreateInfo vkctxInfo{};
 
   // Using Vulkan 1.2+ for native buffer device address support
@@ -744,7 +744,7 @@ int main(int argc, char** argv)
   // Request decompression extension
   vkctxInfo.addDeviceExtension(VK_NV_MEMORY_DECOMPRESSION_EXTENSION_NAME);
 
-  if (!vkctx.init(vkctxInfo))
+  if(!vkctx.init(vkctxInfo))
   {
     LOGE("Vulkan context initialization failed!");
     return -1;
@@ -752,8 +752,7 @@ int main(int argc, char** argv)
 
   // Initialize Vulkan function pointers
   vk::DynamicLoader dl;
-  auto vkGetInstanceProcAddr =
-    dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+  auto              vkGetInstanceProcAddr = dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
 
   VULKAN_HPP_DEFAULT_DISPATCHER.init(vkGetInstanceProcAddr);
   VULKAN_HPP_DEFAULT_DISPATCHER.init(vkctx.m_instance);
@@ -761,8 +760,8 @@ int main(int argc, char** argv)
 
 #ifndef VK_NV_memory_decompression
   // Initialize decompression extension function pointer
-  vkCmdDecompressMemoryIndirectCountNV = PFN_vkCmdDecompressMemoryIndirectCountNV(
-    vkGetInstanceProcAddr(vkctx.m_instance, "vkCmdDecompressMemoryIndirectCountNV"));
+  vkCmdDecompressMemoryIndirectCountNV =
+      PFN_vkCmdDecompressMemoryIndirectCountNV(vkGetInstanceProcAddr(vkctx.m_instance, "vkCmdDecompressMemoryIndirectCountNV"));
 #endif
 
   // Printing which GPU we are using
