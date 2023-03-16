@@ -1,4 +1,4 @@
-**vk_memory_decompression**
+# vk_memory_decompression
 
 This example shows how to use the VK_NV_memory_decompression Vulkan memory decompresion extension to compress and decompress with
 NVIDIA GDeflate using the NVIDIA libdeflate fork.
