@@ -30,6 +30,8 @@
 #include "nvvk/renderpasses_vk.hpp"
 #include "nvvk/buffers_vk.hpp"
 #include "nvvk/resourceallocator_vk.hpp"
+#include "nvvk/vulkanhppsupport.hpp"
+
 
 #include "libdeflate/libdeflate.h"
 
@@ -476,7 +478,7 @@ static bool DecompressGPU(const std::string& outFile, const std::string& inFile,
   LOGI("Decompressing %s\n", inFile.c_str());
 
   // Allocate intermediate buffers
-  nvvk::ResourceAllocatorDedicated alloc;
+  nvvkpp::ResourceAllocatorDedicated alloc;
   alloc.init(ctx.m_device, ctx.m_physicalDevice);
 
   // Buffer for transfer
