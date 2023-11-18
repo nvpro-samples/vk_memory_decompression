@@ -341,9 +341,13 @@ static bool Compress(const std::string& outFile, const std::string& inFile, uint
   fout << OutputCompressedPageStream::endOfPagesTag;
 
   // Write stream footer
-  OutputCompressedPageStream::Footer footer;
-  footer.tailPageUncompressedSize = uncompressedSize % kGDeflatePageSize;
-  footer.crc32                    = crc32;
+  OutputCompressedPageStream::Footer footer{0};
+
+  if(uncompressedSize > 0)
+  {
+    footer.tailPageUncompressedSize = uncompressedSize % kGDeflatePageSize > 0 ? uncompressedSize % kGDeflatePageSize : kGDeflatePageSize;
+    footer.crc32 = crc32;
+  }
 
   fout << footer;
 
@@ -756,9 +760,7 @@ int main(int argc, char** argv)
   vk::DynamicLoader dl;
   auto              vkGetInstanceProcAddr = dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
 
-  VULKAN_HPP_DEFAULT_DISPATCHER.init(vkGetInstanceProcAddr);
-  VULKAN_HPP_DEFAULT_DISPATCHER.init(vkctx.m_instance);
-  VULKAN_HPP_DEFAULT_DISPATCHER.init(vkctx.m_device);
+  VULKAN_HPP_DEFAULT_DISPATCHER.init(vkctx.m_instance, vkGetInstanceProcAddr, vkctx.m_device);
 
 #ifndef VK_NV_memory_decompression
   // Initialize decompression extension function pointer
