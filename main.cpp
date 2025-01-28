@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -757,7 +757,11 @@ int main(int argc, char** argv)
   }
 
   // Initialize Vulkan function pointers
+#if VK_HEADER_VERSION >= 304
+  vk::detail::DynamicLoader dl;
+#else
   vk::DynamicLoader dl;
+#endif
   auto              vkGetInstanceProcAddr = dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
 
   VULKAN_HPP_DEFAULT_DISPATCHER.init(vkctx.m_instance, vkGetInstanceProcAddr, vkctx.m_device);
