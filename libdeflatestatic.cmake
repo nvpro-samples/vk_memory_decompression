@@ -1,6 +1,13 @@
-# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
 
 set(LIBDEF_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libdeflate" )
+
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" ARCH_PROC)
+if(ARCH_PROC MATCHES "^(arm|aarch64)")
+    set(ARCH_DIR "arm")
+elseif(ARCH_PROC MATCHES "^(x86_64|amd64|i[3-6]86)")
+    set(ARCH_DIR "x86")
+endif()
 
 set(SOURCES
   ${LIBDEF_DIR}/lib/adler32.c
@@ -12,7 +19,7 @@ set(SOURCES
   ${LIBDEF_DIR}/lib/zlib_compress.c
   ${LIBDEF_DIR}/lib/zlib_decompress.c
   ${LIBDEF_DIR}/lib/utils.c
-  ${LIBDEF_DIR}/lib/x86/cpu_features.c
+  ${LIBDEF_DIR}/lib/${ARCH_DIR}/cpu_features.c
 )
 
 set(HEADERS
@@ -27,13 +34,9 @@ set(HEADERS
   ${LIBDEF_DIR}/lib/lib_common.h
   ${LIBDEF_DIR}/lib/matchfinder_common.h
   ${LIBDEF_DIR}/lib/unaligned.h
-  ${LIBDEF_DIR}/lib/x86/adler32_impl.h
-  ${LIBDEF_DIR}/lib/x86/cpu_features.h
-  ${LIBDEF_DIR}/lib/x86/crc32_impl.h
-  ${LIBDEF_DIR}/lib/x86/crc32_pclmul_template.h
-  ${LIBDEF_DIR}/lib/x86/decompress_impl.h
-  ${LIBDEF_DIR}/lib/x86/matchfinder_impl.h
 )
+file(GLOB ARCH_HEADERS "${LIBDEF_DIR}/lib/${ARCH_DIR}/*.h")
+list(APPEND HEADERS ${ARCH_HEADERS})
 
 set(PUBLIC_HEADERS
   ${LIBDEF_DIR}/libdeflate.h
