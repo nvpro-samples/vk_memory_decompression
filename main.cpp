@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,23 +19,24 @@
 // Vulkan memory decompression example
 //
 
-#include <vulkan/vulkan.hpp>
-
-#include "nvh/alignment.hpp"
-#include "nvp/nvpsystem.hpp"
-#include "nvh/fileoperations.hpp"
-#include "nvh/inputparser.h"
-#include "nvvk/commands_vk.hpp"
-#include "nvvk/context_vk.hpp"
-#include "nvvk/renderpasses_vk.hpp"
-#include "nvvk/buffers_vk.hpp"
-#include "nvvk/resourceallocator_vk.hpp"
-#include "nvvk/vulkanhppsupport.hpp"
-
+#define VMA_IMPLEMENTATION
 
 #include "libdeflate/libdeflate.h"
 
-VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
+#include <nvutils/file_operations.hpp>
+#include <nvutils/logger.hpp>
+#include <nvutils/parameter_parser.hpp>
+#include <nvvk/barriers.hpp>
+#include <nvvk/commands.hpp>
+#include <nvvk/context.hpp>
+#include <nvvk/resource_allocator.hpp>
+#include <volk/volk.h>
+
+#include <array>
+#include <filesystem>
+#include <fstream>
+#include <type_traits>
+#include <vector>
 
 //--------------------------------------------------------------------------------------------------
 // Declare extension if it is not in Vulkan SDK headers
@@ -73,6 +74,8 @@ static constexpr size_t kGDeflatePageSize = 65536;
 static constexpr size_t kMaxPagesPerBatch = 512;
 // The size of intermediate buffer storage required
 static constexpr size_t kIntermediateBufferSize = kMaxPagesPerBatch * kGDeflatePageSize;
+// API version required by this sample
+static constexpr uint32_t kVulkanApiVersion = VK_API_VERSION_1_4;
 
 //--------------------------------------------------------------------------------------------------
 // A trivial paged compressed stream
@@ -83,8 +86,8 @@ static constexpr size_t kIntermediateBufferSize = kMaxPagesPerBatch * kGDeflateP
 // [(page 0 compressed size - 1):32]
 // [page 0 compressed bits]
 // ...
-// [(page N compressed size - 1):32]
-// [page N compressed bits]
+// [(page N-1 compressed size - 1):32]
+// [page N-1 compressed bits]
 // [end tag:32]
 // [page N uncompressed size:32]
 // [crc32:32]
@@ -92,7 +95,7 @@ static constexpr size_t kIntermediateBufferSize = kMaxPagesPerBatch * kGDeflateP
 // Pages 0 to N-1 all have uncompressed size equal to kGDeflatePageSize. The remainder
 // tail page N uncompressed size is stored in the footer of the stream. Compressed sizes of each
 // page is stored in the PageHeader. A special tag kEndOfPagesTag signals the end-of-pages
-// condition, and is immedeately followed by stream footer data.
+// condition, and is immediately followed by stream footer data.
 //
 template <bool IsInput>
 class CompressedPageStream : public std::conditional_t<IsInput, std::ifstream, std::ofstream>
@@ -119,8 +122,8 @@ public:
   static constexpr uint32_t kEndOfPagesTag = 1;
   inline static PageHeader  endOfPagesTag{kEndOfPagesTag};
 
-  explicit CompressedPageStream(const std::string& filename)
-      : BaseClass(filename.c_str(), BaseClass::binary | (IsInput ? BaseClass::in : BaseClass::out))
+  explicit CompressedPageStream(const std::filesystem::path& path)
+      : BaseClass(path, BaseClass::binary | (IsInput ? BaseClass::in : BaseClass::out))
   {
     if(BaseClass::is_open() && BaseClass::good())
     {
@@ -131,7 +134,7 @@ public:
 
         if(0 != strcmp(magic, kMagic))
         {
-          LOGE("File %s is not a GDEFLATE sample page stream.\n", filename.c_str());
+          LOGE("File %s is not a GDEFLATE sample page stream.\n", nvutils::utf8FromPath(path).c_str());
           this->setstate(std::ios_base::badbit);
         }
       }
@@ -248,13 +251,13 @@ typedef CompressedPageStream<true>  InputCompressedPageStream;
 // This is a batched compressor that will be compressing up to kIntermediateBufferSize bytes
 // of data per batch.
 //
-static bool Compress(const std::string& outFile, const std::string& inFile, uint32_t level)
+static bool Compress(const std::filesystem::path& outFile, const std::filesystem::path& inFile, uint32_t level)
 {
   std::ifstream fin(inFile, std::ifstream::binary | std::ifstream::in);
 
   if(!fin.is_open() || !fin.good())
   {
-    LOGE("Unable to open: %s\n", inFile.c_str());
+    LOGE("Unable to open: %s\n", nvutils::utf8FromPath(inFile).c_str());
     return false;
   }
 
@@ -262,7 +265,7 @@ static bool Compress(const std::string& outFile, const std::string& inFile, uint
 
   if(!fout.is_open() || !fout.good())
   {
-    LOGE("Unable to create file: %s\n", outFile.c_str());
+    LOGE("Unable to create file: %s\n", nvutils::utf8FromPath(outFile).c_str());
     return false;
   }
 
@@ -283,7 +286,7 @@ static bool Compress(const std::string& outFile, const std::string& inFile, uint
   std::vector<char>                         compressed(kIntermediateBufferSize);
   std::vector<libdeflate_gdeflate_out_page> pages(kIntermediateBufferSize / kGDeflatePageSize + 1);
 
-  LOGI("Compressing %s", inFile.c_str());
+  LOGI("Compressing %s", nvutils::utf8FromPath(inFile).c_str());
 
   while(true)
   {
@@ -366,13 +369,13 @@ static bool Compress(const std::string& outFile, const std::string& inFile, uint
 //
 // A trivial non-batched CPU decompressor that decodes each GDeflate page separately.
 //
-static bool DecompressCPU(const std::string& outFile, const std::string& inFile)
+static bool DecompressCPU(const std::filesystem::path& outFile, const std::filesystem::path& inFile)
 {
   InputCompressedPageStream fin(inFile);
 
   if(!fin.is_open() || !fin.good())
   {
-    LOGE("Unable to open file: %s\n", inFile.c_str());
+    LOGE("Unable to open file: %s\n", nvutils::utf8FromPath(inFile).c_str());
     return false;
   }
 
@@ -380,7 +383,7 @@ static bool DecompressCPU(const std::string& outFile, const std::string& inFile)
 
   if(!fout.is_open() || !fout.good())
   {
-    LOGE("Unable to create file: %s\n", outFile.c_str());
+    LOGE("Unable to create file: %s\n", nvutils::utf8FromPath(outFile).c_str());
     return false;
   }
 
@@ -392,7 +395,7 @@ static bool DecompressCPU(const std::string& outFile, const std::string& inFile)
     return false;
   }
 
-  LOGI("Decompressing %s on CPU", inFile.c_str());
+  LOGI("CPU decompressing %s\n", nvutils::utf8FromPath(inFile).c_str());
 
   std::vector<char> in(kGDeflatePageSize);
   std::vector<char> out(kGDeflatePageSize);
@@ -461,73 +464,71 @@ static bool DecompressCPU(const std::string& outFile, const std::string& inFile)
 // parallel GPU decompression. It is expected that the client application will batch together
 // as many pages as the target memory and/or latency requirements allow it to.
 //
-static bool DecompressGPU(const std::string& outFile, const std::string& inFile, nvvk::Context& ctx)
+static VkResult DecompressGPU(const std::filesystem::path& outFile, const std::filesystem::path& inFile, nvvk::Context& ctx)
 {
   InputCompressedPageStream fin(inFile);
 
   if(!fin.is_open() || !fin.good())
   {
-    LOGE("Unable to open file: %s\n", inFile.c_str());
-    return false;
+    LOGE("Unable to open file: %s\n", nvutils::utf8FromPath(inFile).c_str());
+    return VK_ERROR_UNKNOWN;
   }
 
   std::ofstream fout(outFile, std::ofstream::binary | std::ofstream::out);
 
   if(!fout.is_open() || !fout.good())
   {
-    LOGE("Unable to create file: %s\n", outFile.c_str());
-    return false;
+    LOGE("Unable to create file: %s\n", nvutils::utf8FromPath(outFile).c_str());
+    return VK_ERROR_UNKNOWN;
   }
 
-  LOGI("Decompressing %s\n", inFile.c_str());
+  LOGI("GPU decompressing %s\n", nvutils::utf8FromPath(inFile).c_str());
 
   // Allocate intermediate buffers
-  nvvkpp::ResourceAllocatorDedicated alloc;
-  alloc.init(ctx.m_device, ctx.m_physicalDevice);
+  nvvk::ResourceAllocator alloc;
+  NVVK_FAIL_RETURN(alloc.init(VmaAllocatorCreateInfo{.physicalDevice   = ctx.getPhysicalDevice(),
+                                                     .device           = ctx.getDevice(),
+                                                     .instance         = ctx.getInstance(),
+                                                     .vulkanApiVersion = kVulkanApiVersion}));
 
-  // Buffer for transfer
-  nvvk::Buffer transferBuffer =
-      alloc.createBuffer(kIntermediateBufferSize,
-                         vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eTransferSrc
-                             | vk::BufferUsageFlagBits::eTransferDst,
-                         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCached);
+  // Buffer for both CPU->GPU and GPU->CPU transfer
+  // TODO(nbickford): Benchmark using BAR0 data here instead of requiring a copy
+  nvvk::Buffer transferBuffer;
+  NVVK_FAIL_RETURN(alloc.createBuffer(
+      transferBuffer, kIntermediateBufferSize, VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT,
+      VMA_MEMORY_USAGE_AUTO, VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT));
 
   // Buffer for compressed data
-  nvvk::Buffer srcBuffer = alloc.createBuffer(kIntermediateBufferSize,
-                                              vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eTransferDst
-                                                  | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-                                              vk::MemoryPropertyFlagBits::eDeviceLocal);
-
-  VkDeviceAddress srcAddr = nvvk::getBufferDeviceAddress(ctx.m_device, srcBuffer.buffer);
+  nvvk::Buffer srcBuffer;
+  NVVK_FAIL_RETURN(alloc.createBuffer(srcBuffer, kIntermediateBufferSize,
+                                      VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT
+                                          | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT));
 
   // Buffer for uncompressed data
-  nvvk::Buffer dstBuffer = alloc.createBuffer(kIntermediateBufferSize,
-                                              vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eTransferSrc
-                                                  | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-                                              vk::MemoryPropertyFlagBits::eDeviceLocal);
-
-  VkDeviceAddress dstAddr = nvvk::getBufferDeviceAddress(ctx.m_device, dstBuffer.buffer);
+  nvvk::Buffer dstBuffer;
+  NVVK_FAIL_RETURN(alloc.createBuffer(dstBuffer, kIntermediateBufferSize,
+                                      VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT
+                                          | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT));
 
   // Indirect param buffer
-  nvvk::Buffer paramBuffer =
-      alloc.createBuffer(sizeof(VkDeviceSize) + sizeof(VkDecompressMemoryRegionNV) * kMaxPagesPerBatch,
-                         vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eIndirectBuffer
-                             | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-                         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCached);
-
-  VkDeviceAddress paramAddr = nvvk::getBufferDeviceAddress(ctx.m_device, paramBuffer.buffer);
+  nvvk::Buffer       paramBuffer;
+  const VkDeviceSize paramBufferSize = sizeof(VkDeviceSize) + sizeof(VkDecompressMemoryRegionNV) * kMaxPagesPerBatch;
+  NVVK_FAIL_RETURN(alloc.createBuffer(
+      paramBuffer, paramBufferSize, VK_BUFFER_USAGE_2_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT,
+      VMA_MEMORY_USAGE_AUTO, VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT));
 
   // Command Buffer Pool Generator
-  nvvk::CommandPool genCmdBuf(ctx.m_device, ctx.m_queueGCT.queueIndex);
+  const nvvk::QueueInfo& queueGCT = ctx.getQueueInfo(0);
+  VkCommandPool          cmdPool  = nvvk::createTransientCommandPool(ctx.getDevice(), queueGCT.familyIndex);
 
   // Map transfer buffer
-  char* transferPtr = static_cast<char*>(alloc.map(transferBuffer));
+  char* transferPtr = reinterpret_cast<char*>(transferBuffer.mapping);
 
   // Map indirect parameters buffer
-  auto pageCountPtr = static_cast<VkDeviceSize*>(alloc.map(paramBuffer));
+  VkDeviceSize* pageCountPtr = reinterpret_cast<VkDeviceSize*>(paramBuffer.mapping);
 
   // Get pointer to decompression regions
-  auto regionsPtr = reinterpret_cast<VkDecompressMemoryRegionNV*>(pageCountPtr + 1);
+  VkDecompressMemoryRegionNV* regionsPtr = reinterpret_cast<VkDecompressMemoryRegionNV*>(pageCountPtr + 1);
 
   // Expected crc32 to be filled from stream footer
   uint32_t expectedCrc32 = 0;
@@ -590,12 +591,12 @@ static bool DecompressGPU(const std::string& outFile, const std::string& inFile,
         break;
 
       // Preapare page decompression parameters
-      auto region                 = regionsPtr + *pageCountPtr;
-      region->srcAddress          = srcAddr + compressedBytesThisBatch;
-      region->dstAddress          = dstAddr + page * kGDeflatePageSize;
-      region->compressedSize      = lastPageCompressedSize;
-      region->decompressedSize    = kGDeflatePageSize;
-      region->decompressionMethod = VK_MEMORY_DECOMPRESSION_METHOD_GDEFLATE_1_0_BIT_NV;
+      VkDecompressMemoryRegionNV* region = regionsPtr + *pageCountPtr;
+      region->srcAddress                 = srcBuffer.address + compressedBytesThisBatch;
+      region->dstAddress                 = dstBuffer.address + page * kGDeflatePageSize;
+      region->compressedSize             = lastPageCompressedSize;
+      region->decompressedSize           = kGDeflatePageSize;
+      region->decompressionMethod        = VK_MEMORY_DECOMPRESSION_METHOD_GDEFLATE_1_0_BIT_NV;
 
       // Read compressed page bits to transfer buffer
       fin.read(transferPtr + compressedBytesThisBatch, lastPageCompressedSize);
@@ -613,68 +614,65 @@ static bool DecompressGPU(const std::string& outFile, const std::string& inFile,
 
     // Flush the mapped buffers
     {
-      auto tbmi = alloc.getMemoryAllocator()->getMemoryInfo(transferBuffer.memHandle);
-      auto pbmi = alloc.getMemoryAllocator()->getMemoryInfo(paramBuffer.memHandle);
-
-      // vkFlushMappedMemoryRanges requires sizes to be a multiple of nonCoherentAtomSize:
-      const VkDeviceSize atomSize = ctx.m_physicalInfo.properties10.limits.nonCoherentAtomSize;
-
-      vk::MappedMemoryRange flushRanges[2] = {
-          vk::MappedMemoryRange(tbmi.memory, 0, nvh::align_up(compressedBytesThisBatch, atomSize)),
-          vk::MappedMemoryRange(pbmi.memory, 0,
-                                nvh::align_up(sizeof(*pageCountPtr) + *pageCountPtr * sizeof(VkDecompressMemoryRegionNV), atomSize))};
-
-      vkFlushMappedMemoryRanges(ctx.m_device, std::extent_v<decltype(flushRanges)>,
-                                reinterpret_cast<const VkMappedMemoryRange*>(flushRanges));
+      NVVK_FAIL_RETURN(alloc.autoFlushBuffer(transferBuffer, 0, compressedBytesThisBatch));
+      NVVK_FAIL_RETURN(alloc.autoFlushBuffer(paramBuffer, 0, paramBufferSize));
     }
 
-    vk::CommandBuffer cmdBuf = genCmdBuf.createCommandBuffer();
+    VkCommandBuffer cmdBuf = nvvk::createSingleTimeCommands(ctx.getDevice(), cmdPool);
 
     // Copy compressed data from transfer buffer to source buffer in GPU-local memory
     // NOTE: direct decoding from CPU-local GPU-visible memory may not be performant!
-    auto region = vk::BufferCopy().setSrcOffset(0).setSize(compressedBytesThisBatch);
-    cmdBuf.copyBuffer(transferBuffer.buffer, srcBuffer.buffer, 1, &region);
+    const VkBufferCopy cpuToGpuRegion{.size = compressedBytesThisBatch};
+    vkCmdCopyBuffer(cmdBuf, transferBuffer.buffer, srcBuffer.buffer, 1, &cpuToGpuRegion);
 
-    auto barrier = vk::BufferMemoryBarrier()
-                       .setSrcAccessMask(vk::AccessFlagBits::eTransferWrite)
-                       .setDstAccessMask(vk::AccessFlagBits::eShaderRead)
-                       .setSrcQueueFamilyIndex(ctx.m_queueGCT.queueIndex)
-                       .setDstQueueFamilyIndex(ctx.m_queueGCT.queueIndex)
-                       .setBuffer(srcBuffer.buffer)
-                       .setOffset(0)
-                       .setSize(VK_WHOLE_SIZE);
-
-    cmdBuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eComputeShader,
-                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &barrier, 0, nullptr);
+    nvvk::cmdBufferMemoryBarrier(cmdBuf, nvvk::BufferMemoryBarrierParams{.buffer = srcBuffer.buffer,
+                                                                         .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                                                         .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                                                         .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT});
 
     // Dispatch decompression command for this batch
-#ifdef VK_NV_memory_decompression
-    cmdBuf.decompressMemoryIndirectCountNV(paramAddr + sizeof(*pageCountPtr), paramAddr, sizeof(VkDecompressMemoryRegionNV));
-#else
-    vkCmdDecompressMemoryIndirectCountNV(cmdBuf, paramAddr + sizeof(*pageCountPtr), paramAddr, sizeof(VkDecompressMemoryRegionNV));
-#endif
+    vkCmdDecompressMemoryIndirectCountNV(cmdBuf, paramBuffer.address + sizeof(*pageCountPtr), paramBuffer.address,
+                                         sizeof(VkDecompressMemoryRegionNV));
 
-    barrier.setSrcAccessMask(vk::AccessFlagBits::eShaderWrite)
-        .setDstAccessMask(vk::AccessFlagBits::eTransferRead)
-        .setBuffer(dstBuffer.buffer);
-
-    cmdBuf.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eTransfer,
-                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &barrier, 0, nullptr);
-
-    barrier.setSrcAccessMask(vk::AccessFlagBits::eShaderRead)
-        .setDstAccessMask(vk::AccessFlagBits::eTransferWrite)
-        .setBuffer(srcBuffer.buffer);
-
-    cmdBuf.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eTransfer,
-                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &barrier, 0, nullptr);
+    std::array<VkBufferMemoryBarrier2, 2> transferBarriers;
+    transferBarriers[0] =
+        nvvk::makeBufferMemoryBarrier(nvvk::BufferMemoryBarrierParams{.buffer = dstBuffer.buffer,
+                                                                      .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                                                      .dstStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                                                      .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT});
+    transferBarriers[1] =
+        nvvk::makeBufferMemoryBarrier(nvvk::BufferMemoryBarrierParams{.buffer = srcBuffer.buffer,
+                                                                      .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                                                      .dstStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                                                      .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT});
+    const VkDependencyInfo dependencyInfo{.sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                          .bufferMemoryBarrierCount = uint32_t(transferBarriers.size()),
+                                          .pBufferMemoryBarriers    = transferBarriers.data()};
+    vkCmdPipelineBarrier2(cmdBuf, &dependencyInfo);
 
     // Download decoded data from the destination GPU-local buffer to transfer buffer
-    region.setSize(uncompressedBytesThisBatch);
-    cmdBuf.copyBuffer(dstBuffer.buffer, transferBuffer.buffer, 1, &region);
+    const VkBufferCopy gpuToCpuRegion{.size = uncompressedBytesThisBatch};
+    vkCmdCopyBuffer(cmdBuf, dstBuffer.buffer, transferBuffer.buffer, 1, &gpuToCpuRegion);
+
+    // Make sure the transfer buffer is available to the host:
+    const VkBufferMemoryBarrier2 hostTransferBarrier =
+        nvvk::makeBufferMemoryBarrier(nvvk::BufferMemoryBarrierParams{.buffer        = transferBuffer.buffer,
+                                                                      .srcStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                                                      .dstStageMask  = VK_PIPELINE_STAGE_2_HOST_BIT,
+                                                                      .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                                                      .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT});
+    const VkDependencyInfo hostDependencyInfo{.sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                              .bufferMemoryBarrierCount = 1,
+                                              .pBufferMemoryBarriers    = &hostTransferBarrier};
+    vkCmdPipelineBarrier2(cmdBuf, &hostDependencyInfo);
 
     // Submit and wait for result.
     // NOTE: ideally decompression stage should be pipelined with the IO and upload stages.
-    genCmdBuf.submitAndWait(cmdBuf);  // Destroys cmdBuf
+    // This also destroys cmdBuf.
+    NVVK_FAIL_RETURN(nvvk::endSingleTimeCommands(cmdBuf, ctx.getDevice(), cmdPool, queueGCT.queue));
+
+    // And make sure the transfer buffer is visible to the host:
+    NVVK_FAIL_RETURN(alloc.autoInvalidateBuffer(transferBuffer, 0, uncompressedBytesThisBatch));
 
     // Update rolling crc32
     crc32 = libdeflate_crc32(crc32, transferPtr, uncompressedBytesThisBatch);
@@ -687,19 +685,20 @@ static bool DecompressGPU(const std::string& outFile, const std::string& inFile,
   if(expectedCrc32 != crc32)
   {
     LOGE("CRC32 failed (got %x, expected %x)!\n", crc32, expectedCrc32);
-    return false;
+    return VK_ERROR_UNKNOWN;
   }
 
-  LOGI("Done!\n");
+  LOGI(" - done!\n");
 
   // Clean up
-  alloc.destroy(srcBuffer);
-  alloc.destroy(dstBuffer);
-  alloc.destroy(transferBuffer);
-  alloc.destroy(paramBuffer);
+  vkDestroyCommandPool(ctx.getDevice(), cmdPool, nullptr);
+  alloc.destroyBuffer(srcBuffer);
+  alloc.destroyBuffer(dstBuffer);
+  alloc.destroyBuffer(transferBuffer);
+  alloc.destroyBuffer(paramBuffer);
   alloc.deinit();
 
-  return true;
+  return VK_SUCCESS;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -707,64 +706,53 @@ static bool DecompressGPU(const std::string& outFile, const std::string& inFile,
 //
 int main(int argc, char** argv)
 {
-  // setup some basic things for the sample, logging file for example
-  NVPSystem system(PROJECT_NAME);
+  // Set up argument parsing
+  nvutils::ParameterRegistry registry;
+  std::string                in, out;
+  uint32_t                   cpu_compression_level = 0;
+  bool                       do_cpu_compression = false, do_cpu_decompression = false;
+  registry.add({.name = "input", .help = "input file", .shortName = "i"}, &in);
+  registry.add({.name = "output", .help = "output file", .shortName = "o"}, &out);
+  registry.add({.name = "cpu_compress", .help = "(optional) compress input file to output file at level 1..12.", .shortName = "c"},
+               &cpu_compression_level);
+  registry.add({.name = "cpu_decompress", .help = "Instead of decompressing on the GPU, decompress on the CPU.", .shortName = "d"},
+               &do_cpu_decompression, true);
 
-  InputParser parser(argc, argv);
+  nvutils::ParameterParser parser(
+      "vk_memory_decompression: Uses the Vulkan VK_NV_memory_decompression extension to decompress GDeflate data on the GPU.");
+  parser.add(registry);
+  parser.parse(argc, argv);
 
-  const std::string in  = parser.getString("-i");
-  const std::string out = parser.getString("-o");
-
-  if(parser.exist("-h") || in.empty() || out.empty())
+  if(in.empty() || out.empty())
   {
-    LOGE("\n vk_memory_decompression.exe OPTIONS\n");
-    LOGE("     -c <level> : compress input file to output file at level 1..12\n");
-    LOGE("     -d         : (optional) decompress on CPU\n");
-    LOGE("     -i <file>  : input file\n");
-    LOGE("     -o <file>  : output file\n");
-    return 1;
+    parser.printHelp();
+    return EXIT_FAILURE;
   }
 
-  if(parser.exist("-c"))
+  if(cpu_compression_level > 0)
   {
     // Do compression if requested
-    const uint32_t level = parser.getInt("-c", 8);
-    return Compress(out, in, level) ? 0 : -1;
+    return Compress(out, in, cpu_compression_level) ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
-  if(parser.exist("-d"))
+  if(do_cpu_decompression)
   {
     // Do CPU decompression if requested
-    return DecompressCPU(out, in) ? 0 : -1;
+    return DecompressCPU(out, in) ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
   // Do GPU decompression by default
 
   // Creating the Vulkan instance and device
-  nvvk::Context           vkctx;
-  nvvk::ContextCreateInfo vkctxInfo{};
+  nvvk::Context         vkctx;
+  nvvk::ContextInitInfo initInfo{.instanceExtensions = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME},
+                                 .deviceExtensions = {nvvk::ExtensionInfo{.extensionName = VK_NV_MEMORY_DECOMPRESSION_EXTENSION_NAME}},
+                                 .apiVersion = kVulkanApiVersion};
 
-  // Using Vulkan 1.2+ for native buffer device address support
-  vkctxInfo.setVersion(1, 2);
-
-  // Request decompression extension
-  vkctxInfo.addDeviceExtension(VK_NV_MEMORY_DECOMPRESSION_EXTENSION_NAME);
-
-  if(!vkctx.init(vkctxInfo))
+  if(VK_SUCCESS != NVVK_FAIL_REPORT(vkctx.init(initInfo)))
   {
-    LOGE("Vulkan context initialization failed!");
-    return -1;
+    return EXIT_FAILURE;
   }
-
-  // Initialize Vulkan function pointers
-#if VK_HEADER_VERSION >= 304
-  vk::detail::DynamicLoader dl;
-#else
-  vk::DynamicLoader dl;
-#endif
-  auto              vkGetInstanceProcAddr = dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
-
-  VULKAN_HPP_DEFAULT_DISPATCHER.init(vkctx.m_instance, vkGetInstanceProcAddr, vkctx.m_device);
 
 #ifndef VK_NV_memory_decompression
   // Initialize decompression extension function pointer
@@ -772,13 +760,9 @@ int main(int argc, char** argv)
       PFN_vkCmdDecompressMemoryIndirectCountNV(vkGetInstanceProcAddr(vkctx.m_instance, "vkCmdDecompressMemoryIndirectCountNV"));
 #endif
 
-  // Printing which GPU we are using
-  vk::PhysicalDevice pd(vkctx.m_physicalDevice);
-  LOGI("Using GPU: %s\n", pd.getProperties().deviceName.data());
-
-  const bool result = DecompressGPU(out, in, vkctx);
+  const VkResult result = DecompressGPU(out, in, vkctx);
 
   vkctx.deinit();
 
-  return result ? 0 : -1;
+  return (VK_SUCCESS == result) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

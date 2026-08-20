@@ -1,0 +1,30 @@
+#################
+## Cloned folders
+#################
+nvpro_core/
+nvpro_core2/
+/articles_and_docs/
+/develop/
+/maintenance/
+/nvpro_internal/
+/restricted/
+/shipped/
+
+##################
+## Build artifacts
+##################
+_bin/
+_install/
+bin_x64/
+downloaded_resources/
+_downloaded_resources
+__pycache__
+
+# Developers typically name their CMake build directory one of these:
+cmake_build/
+cmake_build_linux/
+cmake_build_win/
+cmake_build_legacy/
+cmake_built/
+build/
+build_legacy/
